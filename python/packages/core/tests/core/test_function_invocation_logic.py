@@ -2863,6 +2863,94 @@ async def test_function_invocation_config_additional_tools(chat_client_base: Sup
     assert len(function_calls) >= 1
 
 
+def _batch_classification_tools():
+    @tool(name="guarded_write", approval_mode="always_require")
+    def guarded_write(location: str) -> str:
+        return f"wrote {location}"
+
+    from agent_framework import FunctionTool
+
+    declaration_func = FunctionTool(
+        name="declaration_func",
+        func=None,
+        description="declaration only",
+        input_model={"type": "object", "properties": {"arg1": {"type": "string"}}},
+    )
+    return [guarded_write, declaration_func]
+
+
+async def test_declaration_only_call_before_approval_call_still_pauses_for_approval():
+    """Regression for #8079: a declaration-only call earlier in the batch must
+    not mask an always_require call later in it."""
+    from agent_framework._tools import _try_execute_function_call_groups
+
+    calls = [
+        Content.from_function_call(call_id="c1", name="declaration_func", arguments='{"arg1": "x"}'),
+        Content.from_function_call(call_id="c2", name="guarded_write", arguments='{"location": "y"}'),
+    ]
+    result_groups, _ = await _try_execute_function_call_groups(
+        custom_args={}, function_calls=calls, tools=_batch_classification_tools(), config={}
+    )
+    approval_requests = [
+        content for group in result_groups for content in group if content.type == "function_approval_request"
+    ]
+    assert approval_requests, "approval request must surface regardless of batch position"
+    assert not any(content.type == "function_result" for group in result_groups for content in group)
+
+
+async def test_unknown_call_before_approval_call_does_not_raise_with_terminate_on_unknown():
+    """Regression for #8079: the user-input pause takes precedence over
+    unknown-call termination even when the unknown call comes first."""
+    from agent_framework._tools import _try_execute_function_call_groups
+
+    calls = [
+        Content.from_function_call(call_id="c0", name="not_a_real_tool", arguments="{}"),
+        Content.from_function_call(call_id="c2", name="guarded_write", arguments='{"location": "y"}'),
+    ]
+    result_groups, _ = await _try_execute_function_call_groups(
+        custom_args={},
+        function_calls=calls,
+        tools=_batch_classification_tools(),
+        config={"terminate_on_unknown_calls": True},
+    )
+    assert any(
+        content.type == "function_approval_request" for group in result_groups for content in group
+    )
+
+
+async def test_unknown_call_before_declaration_only_does_not_raise_with_terminate_on_unknown():
+    """Regression for #8079: declaration-only is also a user-input pause, so it
+    wins over unknown-call termination anywhere in the batch."""
+    from agent_framework._tools import _try_execute_function_call_groups
+
+    calls = [
+        Content.from_function_call(call_id="c0", name="not_a_real_tool", arguments="{}"),
+        Content.from_function_call(call_id="c1", name="declaration_func", arguments='{"arg1": "x"}'),
+    ]
+    result_groups, _ = await _try_execute_function_call_groups(
+        custom_args={},
+        function_calls=calls,
+        tools=_batch_classification_tools(),
+        config={"terminate_on_unknown_calls": True},
+    )
+    flattened = [content for group in result_groups for content in group]
+    assert flattened and all(getattr(content, "user_input_request", False) for content in flattened)
+
+
+async def test_unknown_call_alone_still_raises_with_terminate_on_unknown():
+    """The tightened precedence must not soften the pure unknown-call case."""
+    from agent_framework._tools import _try_execute_function_call_groups
+
+    calls = [Content.from_function_call(call_id="c0", name="not_a_real_tool", arguments="{}")]
+    with pytest.raises(KeyError, match="not found"):
+        await _try_execute_function_call_groups(
+            custom_args={},
+            function_calls=calls,
+            tools=_batch_classification_tools(),
+            config={"terminate_on_unknown_calls": True},
+        )
+
+
 async def test_function_invocation_config_include_detailed_errors_false(chat_client_base: SupportsChatGetResponse):
     """Test that include_detailed_errors=False returns generic error messages."""
 
