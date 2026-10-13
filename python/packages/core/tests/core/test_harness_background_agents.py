@@ -838,6 +838,44 @@ async def test_release_session_times_out_if_task_ignores_cancellation() -> None:
         await asyncio.wait_for(task, timeout=1.0)
 
 
+async def test_release_session_timeout_bounds_deferred_cancellation_cleanup() -> None:
+    """A task that keeps catching CancelledError for cleanup must not extend the release past its timeout."""
+    provider = _make_provider(_FakeAgent("Worker"))
+    session = _make_session()
+
+    runtime = provider._get_runtime(session)
+    started = asyncio.Event()
+
+    async def _deferred_cleanup() -> str:
+        try:
+            started.set()
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            pass
+        # Repeatedly swallow further cancellations until the cleanup window elapses.
+        finish_by = asyncio.get_running_loop().time() + 0.3
+        while True:
+            try:
+                await asyncio.sleep(max(0.0, finish_by - asyncio.get_running_loop().time()))
+                return "cleaned up"
+            except asyncio.CancelledError:
+                continue
+
+    task = asyncio.create_task(_deferred_cleanup())
+    runtime.in_flight_tasks[1] = task
+    await started.wait()
+
+    start = asyncio.get_running_loop().time()
+    await provider.release_session(session, cancel_running=True, timeout=0.05)
+    elapsed = asyncio.get_running_loop().time() - start
+
+    assert elapsed < 0.3
+    assert session.session_id not in provider._runtime
+
+    # The abandoned task still finishes its cleanup on its own.
+    assert await asyncio.wait_for(task, timeout=1.0) == "cleaned up"
+
+
 async def test_release_session_does_not_pop_replacement_runtime() -> None:
     """A release of an old runtime should not remove a replacement runtime."""
     provider = _make_provider(_FakeAgent("Worker"))

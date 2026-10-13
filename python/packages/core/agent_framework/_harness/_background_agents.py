@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, MutableMapping, Sequence
+from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, ClassVar, cast
@@ -134,9 +134,11 @@ class _RuntimeState:
 # ---------------------------------------------------------------------------
 
 
-async def _run_agent(awaitable: Awaitable[AgentResponse[Any]]) -> AgentResponse[Any]:
-    """Wrap an Awaitable in a proper coroutine for use with asyncio.create_task."""
-    return await awaitable
+async def _run_agent(agent: SupportsAgentRun, messages: Any, *, session: AgentSession) -> AgentResponse[Any]:
+    """Start the agent run inside the task and return its response."""
+    # The run coroutine is created here rather than at the call site so a task that is
+    # cancelled before its first step does not leave an unawaited agent coroutine behind.
+    return await agent.run(messages, session=session)
 
 
 def _log_abandoned_background_task(task: asyncio.Task[Any]) -> None:
@@ -442,19 +444,19 @@ class BackgroundAgentsProvider(ContextProvider):
                             task.add_done_callback(_log_abandoned_background_task)
                     return
 
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*pending, return_exceptions=True),
-                    timeout=remaining,
-                )
-            except asyncio.TimeoutError:
-                not_done = [task for task in pending if not task.done()]
+            # asyncio.wait only observes the deadline: it neither cancels the tasks nor, unlike
+            # wait_for, keeps awaiting a gather whose cancellation a deferred-cleanup task keeps
+            # swallowing, so the release cannot be extended past it.
+            done, still_pending = await asyncio.wait(pending, timeout=remaining)
+            if still_pending:
                 logger.warning(
                     "Session release timed out waiting for %s task(s). They will be abandoned.",
-                    len(not_done),
+                    len(still_pending),
                 )
-                for task in not_done:
+                for task in still_pending:
                     task.add_done_callback(_log_abandoned_background_task)
+                # Tasks that did finish inside the deadline still need their exceptions observed.
+                await asyncio.gather(*done, return_exceptions=True)
                 return
 
     async def before_run(
@@ -489,7 +491,7 @@ class BackgroundAgentsProvider(ContextProvider):
 
             sub_session = bg_agent.create_session()
 
-            async_task = asyncio.create_task(_run_agent(bg_agent.run(input, session=sub_session)))
+            async_task = asyncio.create_task(_run_agent(bg_agent, input, session=sub_session))
             try:
                 runtime.track_task(task_id, async_task)
             except RuntimeError as exc:
@@ -639,7 +641,7 @@ class BackgroundAgentsProvider(ContextProvider):
 
             bg_agent = self._agents[key]
 
-            async_task = asyncio.create_task(_run_agent(bg_agent.run(text, session=sub_session)))
+            async_task = asyncio.create_task(_run_agent(bg_agent, text, session=sub_session))
             try:
                 runtime.track_task(task_id, async_task)
             except RuntimeError as exc:
