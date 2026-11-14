@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import stat
 import threading
 import time
 import uuid
@@ -35,7 +36,7 @@ from dataclasses import dataclass
 from functools import partial
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeAlias, TypeVar, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar, Literal, TypeAlias, TypeVar, cast
 
 import msgspec
 from typing_extensions import TypedDict
@@ -181,6 +182,29 @@ def get_message_identity(message: Message) -> MessageIdentity:
 def _get_message_hash(message: Message) -> MessageIdentity:
     """Stable hash for sequence matching."""
     return get_message_identity(message)
+
+
+def _same_stored_payload(left: Any, right: Any) -> bool:
+    """Return whether two serialized payloads are identical, including value types.
+
+    Plain ``==`` treats ``1`` and ``True`` (and ``1.0``) as equal, but JSON and
+    MessagePack store them differently, so a type-only change has to be persisted.
+    """
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, Mapping):
+        left_mapping = cast(Mapping[str, Any], left)
+        right_mapping = cast(Mapping[str, Any], right)
+        return left_mapping.keys() == right_mapping.keys() and all(
+            _same_stored_payload(left_mapping[key], right_mapping[key]) for key in left_mapping
+        )
+    if isinstance(left, list):
+        left_items = cast(list[Any], left)
+        right_items = cast(list[Any], right)
+        return len(left_items) == len(right_items) and all(
+            _same_stored_payload(a, b) for a, b in zip(left_items, right_items, strict=True)
+        )
+    return bool(left == right)
 
 
 def filter_new_messages(existing: Sequence[Message], incoming: Sequence[Message]) -> list[Message]:
@@ -2801,7 +2825,7 @@ class FileHistoryProvider(HistoryProvider):
         merged = list(existing)
         changed = False
         for index, message in enumerate(incoming[:stored_count]):
-            if message.to_dict() != existing[index].to_dict():
+            if not _same_stored_payload(message.to_dict(), existing[index].to_dict()):
                 merged[index] = message
                 changed = True
         return merged if changed else None
@@ -2813,7 +2837,8 @@ class FileHistoryProvider(HistoryProvider):
         serialized = "".join(
             f"{self._serialize_json_message(message)}\n" for message in [*merged, *new_messages]
         ).encode("utf-8")
-        self._replace_history_file(file_path, serialized)
+        with self._staging_history_file(file_path) as stage:
+            stage.write(serialized)
 
     def _rewrite_msgpack_messages(
         self, file_path: Path, merged: Sequence[Message], new_messages: Sequence[Message]
@@ -2821,26 +2846,40 @@ class FileHistoryProvider(HistoryProvider):
         """Replace the transcript atomically after every record passes the reader's checks."""
         record = bytearray()
         # Encode into a sibling staging file so a rejected record never touches the history.
-        stage_path = file_path.with_name(f".{file_path.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            with stage_path.open("wb") as stage:
-                for message in [*merged, *new_messages]:
-                    self._encode_msgpack_record(message, record)
-                    stage.write(len(record).to_bytes(self._MSGPACK_RECORD_HEADER_BYTES, "big"))
-                    stage.write(record)
-            os.replace(stage_path, file_path)
-        finally:
-            stage_path.unlink(missing_ok=True)
+        with self._staging_history_file(file_path) as stage:
+            for message in [*merged, *new_messages]:
+                self._encode_msgpack_record(message, record)
+                stage.write(len(record).to_bytes(self._MSGPACK_RECORD_HEADER_BYTES, "big"))
+                stage.write(record)
 
     @staticmethod
-    def _replace_history_file(file_path: Path, serialized: bytes) -> None:
-        """Write ``serialized`` through a sibling temporary file and replace the history."""
-        temp_path = file_path.with_name(f".{file_path.name}.{uuid.uuid4().hex}.tmp")
+    @contextlib.contextmanager
+    def _staging_history_file(file_path: Path) -> Generator[BinaryIO]:
+        """Yield a sibling staging file that replaces ``file_path`` on clean exit.
+
+        The name carries only a short prefix and a random token: a session ID may
+        already use most of the filesystem's component budget, so embedding the
+        history filename would push the staging name past it.
+
+        The staging file is created with the history's own access bits (or ``0600``
+        when it does not exist yet) so replacing a restricted transcript never
+        widens who can read it, regardless of the process umask.
+        """
+        stage_path = file_path.with_name(f".history-{uuid.uuid4().hex}.tmp")
         try:
-            temp_path.write_bytes(serialized)
-            os.replace(temp_path, file_path)
+            mode = stat.S_IMODE(file_path.stat().st_mode)
+        except FileNotFoundError:
+            mode = 0o600
+        descriptor = os.open(stage_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        try:
+            with os.fdopen(descriptor, "wb") as stage:
+                yield stage
+            # os.open applies the umask, so set the intended bits explicitly.
+            os.chmod(stage_path, mode)
+            os.replace(stage_path, file_path)
         finally:
-            temp_path.unlink(missing_ok=True)
+            with contextlib.suppress(FileNotFoundError):
+                stage_path.unlink()
 
     def _encode_msgpack_record(self, message: Message, record: bytearray) -> None:
         """Encode ``message`` into ``record`` and reject it if the reader would refuse the record."""

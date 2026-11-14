@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import os
+import stat
 import threading
 import time
 import tracemalloc
@@ -2519,6 +2520,61 @@ class TestFileHistoryProvider:
         loaded = await FileHistoryProvider(tmp_path, serialization_format=serialization_format).get_messages("s1")
         assert [message.text for message in loaded] == ["one", "two", "three"]
         assert "_excluded" not in loaded[1].additional_properties
+
+    @pytest.mark.parametrize("serialization_format", ["json", "msgpack"])
+    async def test_annotation_update_preserves_restricted_file_permissions(
+        self, tmp_path: Path, serialization_format: Literal["json", "msgpack"]
+    ) -> None:
+        """Replacing a 0600 transcript must not widen it, whatever the process umask is."""
+        provider = FileHistoryProvider(tmp_path, serialization_format=serialization_format)
+        message = Message(role="user", contents=["question"], message_id="m1")
+        await provider.save_messages("s1", [message])
+        session_file = provider._session_file_path("s1")
+        await asyncio.to_thread(session_file.chmod, 0o600)
+
+        previous_umask = os.umask(0o022)
+        try:
+            message.additional_properties["_excluded"] = True
+            await provider.save_messages("s1", [message])
+        finally:
+            os.umask(previous_umask)
+
+        assert stat.S_IMODE(session_file.stat().st_mode) == 0o600
+        loaded = await FileHistoryProvider(tmp_path, serialization_format=serialization_format).get_messages("s1")
+        assert loaded[0].additional_properties["_excluded"] is True
+
+    @pytest.mark.parametrize("serialization_format", ["json", "msgpack"])
+    async def test_annotation_update_persists_type_only_payload_change(
+        self, tmp_path: Path, serialization_format: Literal["json", "msgpack"]
+    ) -> None:
+        """``1`` and ``True`` are equal in Python but distinct on disk, so the change persists."""
+        provider = FileHistoryProvider(tmp_path, serialization_format=serialization_format)
+        message = Message(role="user", contents=["question"], message_id="m1")
+        message.additional_properties["flag"] = 1
+        await provider.save_messages("s1", [message])
+
+        message.additional_properties["flag"] = True
+        await provider.save_messages("s1", [message])
+
+        loaded = await FileHistoryProvider(tmp_path, serialization_format=serialization_format).get_messages("s1")
+        assert loaded[0].additional_properties["flag"] is True
+
+    @pytest.mark.parametrize("serialization_format", ["json", "msgpack"])
+    async def test_annotation_update_works_for_long_session_ids(
+        self, tmp_path: Path, serialization_format: Literal["json", "msgpack"]
+    ) -> None:
+        """A session ID the append path accepts must also support the rewrite."""
+        provider = FileHistoryProvider(tmp_path, serialization_format=serialization_format)
+        session_id = "a" * 240
+        message = Message(role="user", contents=["question"], message_id="m1")
+        await provider.save_messages(session_id, [message])
+
+        message.additional_properties["_excluded"] = True
+        await provider.save_messages(session_id, [message])
+
+        loaded = await FileHistoryProvider(tmp_path, serialization_format=serialization_format).get_messages(session_id)
+        assert loaded[0].additional_properties["_excluded"] is True
+        assert not await asyncio.to_thread(lambda: list(tmp_path.glob(".history-*.tmp")))
 
 
 # ---------------------------------------------------------------------------
