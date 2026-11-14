@@ -2384,6 +2384,142 @@ class TestFileHistoryProvider:
         loaded = await provider.get_messages("s1")
         assert [message.text for message in loaded] == ["yes", "first reply", "yes", "second reply"]
 
+    @pytest.mark.parametrize("serialization_format", ["json", "msgpack"])
+    async def test_save_messages_persists_updated_annotations_for_stored_messages(
+        self, tmp_path: Path, serialization_format: Literal["json", "msgpack"]
+    ) -> None:
+        """Annotations added to an already-stored message reach the file.
+
+        Compaction excludes stored messages by annotating them, so a provider that
+        only appends unseen messages would keep the exclusion in memory for the
+        in-memory provider and drop it here.
+        """
+        provider = FileHistoryProvider(tmp_path, serialization_format=serialization_format)
+        first = Message(role="user", contents=["question"], message_id="m1")
+        second = Message(role="assistant", contents=["answer"], message_id="m2")
+        await provider.save_messages("s1", [first, second])
+
+        first.additional_properties["_excluded"] = True
+        first.additional_properties["_exclude_reason"] = "sliding_window"
+        await provider.save_messages("s1", [first, second])
+
+        reloaded = FileHistoryProvider(tmp_path, serialization_format=serialization_format)
+        loaded = await reloaded.get_messages("s1")
+        assert [message.text for message in loaded] == ["question", "answer"]
+        assert loaded[0].additional_properties["_excluded"] is True
+        assert loaded[0].additional_properties["_exclude_reason"] == "sliding_window"
+        assert "_excluded" not in loaded[1].additional_properties
+
+    @pytest.mark.parametrize("serialization_format", ["json", "msgpack"])
+    async def test_save_messages_skips_rewrite_when_nothing_changed(
+        self, tmp_path: Path, serialization_format: Literal["json", "msgpack"]
+    ) -> None:
+        """A replayed transcript with identical payloads leaves the file untouched."""
+        provider = FileHistoryProvider(tmp_path, serialization_format=serialization_format)
+        messages = [
+            Message(role="user", contents=["question"], message_id="m1"),
+            Message(role="assistant", contents=["answer"], message_id="m2"),
+        ]
+        await provider.save_messages("s1", messages)
+        session_file = provider._session_file_path("s1")
+        before = await asyncio.to_thread(session_file.read_bytes)
+        before_mtime = session_file.stat().st_mtime_ns
+
+        await provider.save_messages("s1", messages)
+
+        assert await asyncio.to_thread(session_file.read_bytes) == before
+        assert session_file.stat().st_mtime_ns == before_mtime
+
+    @pytest.mark.parametrize("serialization_format", ["json", "msgpack"])
+    async def test_annotation_update_keeps_transcript_order_and_appends_new_messages(
+        self, tmp_path: Path, serialization_format: Literal["json", "msgpack"]
+    ) -> None:
+        """An updated message keeps its position while later messages still append."""
+        provider = FileHistoryProvider(tmp_path, serialization_format=serialization_format)
+        first = Message(role="user", contents=["one"], message_id="m1")
+        second = Message(role="assistant", contents=["two"], message_id="m2")
+        await provider.save_messages("s1", [first, second])
+
+        second.additional_properties["_excluded"] = True
+        third = Message(role="user", contents=["three"], message_id="m3")
+        await provider.save_messages("s1", [first, second, third])
+
+        loaded = await FileHistoryProvider(tmp_path, serialization_format=serialization_format).get_messages("s1")
+        assert [message.text for message in loaded] == ["one", "two", "three"]
+        assert [message.message_id for message in loaded] == ["m1", "m2", "m3"]
+        assert loaded[1].additional_properties["_excluded"] is True
+
+    @pytest.mark.parametrize("serialization_format", ["json", "msgpack"])
+    async def test_annotation_update_uses_the_existing_dedup_contract(
+        self, tmp_path: Path, serialization_format: Literal["json", "msgpack"]
+    ) -> None:
+        """Content-identified repeats stay separate records rather than collapsing."""
+        provider = FileHistoryProvider(tmp_path, serialization_format=serialization_format)
+        await provider.save_messages(
+            "s1", [Message(role="user", contents=["yes"]), Message(role="assistant", contents=["first"])]
+        )
+        # A distinct turn with the same user text: the overlap contract appends it.
+        repeated = Message(role="user", contents=["yes"])
+        repeated.additional_properties["_excluded"] = True
+        await provider.save_messages("s1", [repeated, Message(role="assistant", contents=["second"])])
+
+        loaded = await FileHistoryProvider(tmp_path, serialization_format=serialization_format).get_messages("s1")
+        assert [message.text for message in loaded] == ["yes", "first", "yes", "second"]
+        assert loaded[2].additional_properties["_excluded"] is True
+        assert "_excluded" not in loaded[0].additional_properties
+
+    @pytest.mark.parametrize("serialization_format", ["json", "msgpack"])
+    async def test_annotation_update_rolls_back_when_a_new_record_is_rejected(
+        self, tmp_path: Path, serialization_format: Literal["json", "msgpack"]
+    ) -> None:
+        """A rejected batch restores the previous file, including the pending annotation."""
+        provider = FileHistoryProvider(tmp_path, serialization_format=serialization_format)
+        first = Message(role="user", contents=["question"], message_id="m1")
+        await provider.save_messages("s1", [first])
+        session_file = provider._session_file_path("s1")
+        before = await asyncio.to_thread(session_file.read_bytes)
+
+        first.additional_properties["_excluded"] = True
+        oversized = Message(role="assistant", contents=["x" * 4096], message_id="m2")
+        with (
+            patch.object(
+                FileHistoryProvider,
+                "_encode_msgpack_record" if serialization_format == "msgpack" else "_serialize_json_message",
+                side_effect=ValueError("record rejected"),
+            ),
+            pytest.raises(ValueError, match="record rejected"),
+        ):
+            await provider.save_messages("s1", [first, oversized])
+
+        assert await asyncio.to_thread(session_file.read_bytes) == before
+        loaded = await FileHistoryProvider(tmp_path, serialization_format=serialization_format).get_messages("s1")
+        assert [message.text for message in loaded] == ["question"]
+        assert "_excluded" not in loaded[0].additional_properties
+
+    @pytest.mark.parametrize("serialization_format", ["json", "msgpack"])
+    async def test_partial_replay_does_not_rewrite_records_it_did_not_carry(
+        self, tmp_path: Path, serialization_format: Literal["json", "msgpack"]
+    ) -> None:
+        """A replay covering only the stored suffix appends without touching earlier records."""
+        provider = FileHistoryProvider(tmp_path, serialization_format=serialization_format)
+        first = Message(role="user", contents=["one"], message_id="m1")
+        second = Message(role="assistant", contents=["two"], message_id="m2")
+        await provider.save_messages("s1", [first, second])
+        session_file = provider._session_file_path("s1")
+        before = await asyncio.to_thread(session_file.read_bytes)
+
+        # Only the last stored message is carried, with a changed payload.
+        changed_second = Message(role="assistant", contents=["two"], message_id="m2")
+        changed_second.additional_properties["_excluded"] = True
+        third = Message(role="user", contents=["three"], message_id="m3")
+        await provider.save_messages("s1", [changed_second, third])
+
+        after = await asyncio.to_thread(session_file.read_bytes)
+        assert after.startswith(before)
+        loaded = await FileHistoryProvider(tmp_path, serialization_format=serialization_format).get_messages("s1")
+        assert [message.text for message in loaded] == ["one", "two", "three"]
+        assert "_excluded" not in loaded[1].additional_properties
+
 
 # ---------------------------------------------------------------------------
 # Run-persistence gate tests

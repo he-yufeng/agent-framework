@@ -211,7 +211,7 @@ The vector store API is experimental under the shared `VECTOR_STORES` feature ID
 - **`ContextProvider`** - Base class for context providers (RAG, memory systems)
 - **`HistoryProvider`** - Base class for conversation history storage
 - **`InMemoryHistoryProvider`** - Built-in session-state history provider for local runs
-- **`FileHistoryProvider`** - Experimental append-only file-backed history provider; msgspec JSON Lines is the default and `serialization_format="msgpack"` uses length-prefixed binary MessagePack records. Custom `dumps`/`loads` remain as deprecated JSON-only compatibility hooks and emit `DeprecationWarning` when supplied.
+- **`FileHistoryProvider`** - Experimental append-only file-backed history provider; msgspec JSON Lines is the default and `serialization_format="msgpack"` uses length-prefixed binary MessagePack records. Custom `dumps`/`loads` remain as deprecated JSON-only compatibility hooks and emit `DeprecationWarning` when supplied. A save whose incoming prefix covers the whole stored transcript also persists changed payloads for those stored messages, so in-place compaction annotations reach disk; the rewrite goes through a sibling temporary file and `os.replace`, and a rejected record leaves the previous file untouched. A shorter suffix replay still only appends.
 - **Mixed computer/function workflow history** - The default `HistoryProvider.after_run` defers completed local
   function results for loadable providers that store inputs until the computer reply arrives, so history records
   them once in call order. Custom `after_run` implementations must handle this themselves.

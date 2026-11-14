@@ -2583,6 +2583,10 @@ class FileHistoryProvider(HistoryProvider):
     The custom ``dumps`` and ``loads`` constructor arguments remain available
     for JSON Lines compatibility but are deprecated.
 
+    New messages append. When a save replays the whole stored transcript with
+    changed payloads, for example after compaction annotated stored messages in
+    place, those records are updated too through an atomic replacement.
+
     Security posture:
         Persisted history is stored as plaintext JSONL or binary MessagePack on
         the local filesystem.
@@ -2716,7 +2720,7 @@ class FileHistoryProvider(HistoryProvider):
         state: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
-        """Append messages to the session's history file."""
+        """Append messages to the session's history file, persisting changed stored payloads."""
         mark_feature_used(FeatureIndex.CORE_FILE_HISTORY_PROVIDER)
         del state, kwargs
         if not messages:
@@ -2731,14 +2735,23 @@ class FileHistoryProvider(HistoryProvider):
                 if self.serialization_format == "json":
                     existing_messages = self._read_json_messages(file_path) if file_path.exists() else []
                     new_messages = filter_new_messages(existing_messages, messages)
-                    if new_messages:
-                        with file_path.open("a", encoding="utf-8") as file_handle:
-                            for message in new_messages:
-                                file_handle.write(f"{self._serialize_json_message(message)}\n")
+                    updated = self._updated_stored_messages(existing_messages, messages, new_messages)
+                    if not new_messages and not updated:
+                        return
+                    if updated:
+                        self._rewrite_json_messages(file_path, updated, new_messages)
+                        return
+                    with file_path.open("a", encoding="utf-8") as file_handle:
+                        for message in new_messages:
+                            file_handle.write(f"{self._serialize_json_message(message)}\n")
                     return
                 existing_messages = self._read_msgpack_messages(file_path) if file_path.exists() else []
                 new_messages = filter_new_messages(existing_messages, messages)
-                if not new_messages:
+                updated = self._updated_stored_messages(existing_messages, messages, new_messages)
+                if not new_messages and not updated:
+                    return
+                if updated:
+                    self._rewrite_msgpack_messages(file_path, updated, new_messages)
                     return
                 # Check the whole batch first so a record the reader would reject never reaches
                 # the file and the existing history stays loadable. Records are encoded into one
@@ -2763,6 +2776,71 @@ class FileHistoryProvider(HistoryProvider):
 
         async with async_lock:
             await asyncio.to_thread(_append_messages)
+
+    @staticmethod
+    def _updated_stored_messages(
+        existing: Sequence[Message], incoming: Sequence[Message], new_messages: Sequence[Message]
+    ) -> list[Message] | None:
+        """Return the transcript with updated stored payloads, or ``None`` when nothing changed.
+
+        Compaction excludes stored messages by annotating them in place, so the same
+        transcript can arrive again with updated ``additional_properties`` on messages
+        that are already on disk. ``filter_new_messages`` only reports the unseen tail,
+        which would leave those annotations unpersisted.
+
+        Only an exact overlap with the stored transcript is considered: the incoming
+        prefix must cover the whole stored history, so a partial replay that matched a
+        shorter suffix never rewrites records it did not carry. Payloads are compared as
+        serialized dicts, which is what the reader reconstructs.
+        """
+        if not existing:
+            return None
+        stored_count = len(incoming) - len(new_messages)
+        if stored_count != len(existing):
+            return None
+        merged = list(existing)
+        changed = False
+        for index, message in enumerate(incoming[:stored_count]):
+            if message.to_dict() != existing[index].to_dict():
+                merged[index] = message
+                changed = True
+        return merged if changed else None
+
+    def _rewrite_json_messages(
+        self, file_path: Path, merged: Sequence[Message], new_messages: Sequence[Message]
+    ) -> None:
+        """Replace the transcript atomically so a failed encode leaves the old file intact."""
+        serialized = "".join(
+            f"{self._serialize_json_message(message)}\n" for message in [*merged, *new_messages]
+        ).encode("utf-8")
+        self._replace_history_file(file_path, serialized)
+
+    def _rewrite_msgpack_messages(
+        self, file_path: Path, merged: Sequence[Message], new_messages: Sequence[Message]
+    ) -> None:
+        """Replace the transcript atomically after every record passes the reader's checks."""
+        record = bytearray()
+        # Encode into a sibling staging file so a rejected record never touches the history.
+        stage_path = file_path.with_name(f".{file_path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with stage_path.open("wb") as stage:
+                for message in [*merged, *new_messages]:
+                    self._encode_msgpack_record(message, record)
+                    stage.write(len(record).to_bytes(self._MSGPACK_RECORD_HEADER_BYTES, "big"))
+                    stage.write(record)
+            os.replace(stage_path, file_path)
+        finally:
+            stage_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _replace_history_file(file_path: Path, serialized: bytes) -> None:
+        """Write ``serialized`` through a sibling temporary file and replace the history."""
+        temp_path = file_path.with_name(f".{file_path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp_path.write_bytes(serialized)
+            os.replace(temp_path, file_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def _encode_msgpack_record(self, message: Message, record: bytearray) -> None:
         """Encode ``message`` into ``record`` and reject it if the reader would refuse the record."""
