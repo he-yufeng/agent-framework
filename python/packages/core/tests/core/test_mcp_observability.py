@@ -319,16 +319,14 @@ async def test_mcp_tools_call_mcp_error_sets_error_type(
 
 
 @pytest.mark.parametrize("enable_sensitive_data", [True, False], indirect=True)
-async def test_mcp_tools_call_second_connection_loss_log_respects_sensitive_data(
+async def test_mcp_tools_call_unknown_outcome_log_respects_sensitive_data(
     span_exporter: InMemorySpanExporter,
     enable_sensitive_data: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Second connection loss should retain an error log without exporting exception details by default."""
+    """An ambiguous connection loss keeps a redacted warning and the original span error type."""
     private_error_detail = "founder-secret-token"
     tool = _make_connected_mcp_tool()
-    tool.trust_server_idempotency_hints = True
-    tool._tool_annotations_by_name["get-weather"] = types.ToolAnnotations(idempotent_hint=True)
     tool.session.call_tool = AsyncMock(  # type: ignore[method-assign, union-attr]  # ty: ignore[invalid-assignment]
         side_effect=[
             MCPError(-32000, f"session terminated: {private_error_detail}"),
@@ -340,16 +338,23 @@ async def test_mcp_tools_call_second_connection_loss_log_respects_sensitive_data
 
     span_exporter.clear()
     with (
-        caplog.at_level(logging.ERROR, logger="agent_framework._mcp"),
-        pytest.raises(ToolExecutionException, match="connection lost"),
+        caplog.at_level(logging.WARNING, logger="agent_framework._mcp"),
+        pytest.raises(ToolExecutionException, match="outcome is unknown"),
     ):
         await tool.call_tool("get-weather")
 
     assert tool.session is not None
-    assert getattr(tool.session.call_tool, "await_count", 0) == 2
+    assert getattr(tool.session.call_tool, "await_count", 0) == 1
     assert (private_error_detail in caplog.text) is enable_sensitive_data
     if not enable_sensitive_data:
-        assert "MCP tool call connection closed after reconnection (MCPError)." in caplog.text
+        assert (
+            "MCP tool call outcome is unknown after connection loss; the call was not retried (MCPError)."
+            in caplog.text
+        )
+    call_spans = [span for span in span_exporter.get_finished_spans() if "tools/call" in span.name]
+    assert len(call_spans) == 1
+    assert call_spans[0].attributes.get(OtelAttr.ERROR_TYPE) == "MCPError"  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
+    _assert_error_detail_policy(call_spans[0], private_error_detail, enable_sensitive_data)
 
 
 @pytest.mark.parametrize("enable_sensitive_data", [True, False], indirect=True)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Collection
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextvars import ContextVar
 from typing import Any, Literal, TypeAlias, cast
 from unittest.mock import AsyncMock, Mock, patch
@@ -31,11 +31,7 @@ async def mcp_http_client_factory() -> AsyncIterator[MCPHTTPClientFactory]:
     async def record_request(request: httpx.Request) -> None:
         requests.append(request)
 
-    async def handle(
-        request: httpx.Request,
-        protocol_version: str | None,
-        replayable_principals: Collection[str] = (),
-    ) -> httpx.Response:
+    async def handle(request: httpx.Request, protocol_version: str | None) -> httpx.Response:
         if request.url.path == "/unrelated":
             return httpx.Response(200)
         principal = request.headers.get("Authorization", "")
@@ -79,7 +75,6 @@ async def mcp_http_client_factory() -> AsyncIterator[MCPHTTPClientFactory]:
                                 ),
                             },
                         },
-                        **({"annotations": {"idempotentHint": True}} if principal in replayable_principals else {}),
                     },
                     {
                         "name": f"{principal}-only",
@@ -128,13 +123,12 @@ async def mcp_http_client_factory() -> AsyncIterator[MCPHTTPClientFactory]:
         response_cookies: dict[str, str] | None = None,
         before_request: Callable[[httpx.Request], Awaitable[None]] | None = None,
         protocol_version: str | None = None,
-        replayable_principals: Collection[str] = (),
         **kwargs: Any,
     ) -> httpx.AsyncClient:
         async def handle_with_cookies(request: httpx.Request) -> httpx.Response:
             if before_request is not None:
                 await before_request(request)
-            response = await handle(request, protocol_version, replayable_principals)
+            response = await handle(request, protocol_version)
             if response_cookies and request.method == "POST":
                 method = json.loads(request.content).get("method")
                 if method in response_cookies:
@@ -563,7 +557,6 @@ async def test_recovery_budget_covers_reconnect_and_discovery(
     async with tool, asyncio.timeout(5):
         with (
             patch.object(_connected_client(tool), "call_tool", side_effect=ClosedResourceError()),
-            patch.object(tool, "_is_call_replayable", return_value=True),
             patch.object(tool, method, side_effect=block_recovery),
             patch.object(tool, "request_timeout", timeout),
         ):
@@ -575,8 +568,9 @@ async def test_recovery_budget_covers_reconnect_and_discovery(
                         await asyncio.sleep(0)
                     assert not call.done()
                     release.set()
-                    await call
-                    assert writes["token-a"] == ["retry"]
+                    with pytest.raises(ToolExecutionException, match="outcome is unknown"):
+                        await call
+                    assert writes["token-a"] == []
                 else:
                     with pytest.raises(ToolExecutionException, match="Timed out recovering") as error:
                         await call
@@ -589,7 +583,7 @@ async def test_recovery_budget_covers_reconnect_and_discovery(
         assert tool._header_operations == 0
 
 
-async def test_replay_eligibility_follows_the_dispatched_identity_during_concurrent_recovery(
+async def test_ambiguous_call_is_not_replayed_after_a_concurrent_identity_change(
     mcp_http_client_factory: MCPHTTPClientFactory,
 ) -> None:
     from anyio import ClosedResourceError
@@ -597,9 +591,8 @@ async def test_replay_eligibility_follows_the_dispatched_identity_during_concurr
     from agent_framework._mcp import _ClientMCPConnection
 
     create_client, _, writes = mcp_http_client_factory
-    client = create_client(replayable_principals={"token-a"})
+    client = create_client()
     tool = _tool(client, "token-a")
-    tool.trust_server_idempotency_hints = True
     b_started = asyncio.Event()
     release_b = asyncio.Event()
     a_finished = asyncio.Event()
@@ -924,13 +917,11 @@ async def test_configured_discovery_reloads_tools_when_prompt_recovery_replaces_
             failed_call = AsyncMock(side_effect=ClosedResourceError)
             with (
                 patch.object(connection.client, "call_tool", new=failed_call),
-                patch.object(tool, "_is_call_replayable", return_value=True),
                 patch.object(Client, "list_prompts", new=fail_replacement_prompt_page),
+                pytest.raises(ToolExecutionException, match="outcome is unknown"),
             ):
-                result = await tool.call_tool("session_1_tool_head")
-                assert isinstance(result, list)
-                assert len(result) == 1 and result[0].text == "ok"
-                failed_call.assert_awaited_once()
+                await tool.call_tool("session_1_tool_head")
+            failed_call.assert_awaited_once()
             assert server.generation == 3
             assert {function.name for function in tool.functions} == {
                 "session_3_tool_head",
@@ -1052,21 +1043,21 @@ async def test_simultaneous_connection_failures_share_one_recovery(
 
     async with tool:
         original_connection = tool._connection
-        with (
-            patch.object(_connected_client(tool), "call_tool", side_effect=fail_call),
-            patch.object(tool, "_is_call_replayable", return_value=True),
-        ):
+        with patch.object(_connected_client(tool), "call_tool", side_effect=fail_call):
             first = asyncio.create_task(tool.call_tool("record", marker="first"))
             second = asyncio.create_task(tool.call_tool("record", marker="second"))
+            outcomes: list[Any] = []
             try:
                 await asyncio.wait_for(arrivals.get(), timeout=5)
                 await asyncio.wait_for(arrivals.get(), timeout=5)
             finally:
                 fail.set()
-                await asyncio.wait_for(asyncio.gather(first, second), timeout=5)
+                outcomes = await asyncio.wait_for(asyncio.gather(first, second, return_exceptions=True), timeout=5)
+        assert all(isinstance(outcome, ToolExecutionException) for outcome in outcomes)
+        assert all("outcome is unknown" in str(outcome) for outcome in outcomes)
         assert tool._connection is not original_connection
         assert len(_requests_for_method(requests, "initialize")) == 2
-        assert sorted(writes["token-a"]) == ["first", "second"]
+        assert writes["token-a"] == []
 
 
 async def test_liveness_failure_during_recovery_discovery_recovers_the_replacement_connection(
@@ -1090,13 +1081,17 @@ async def test_liveness_failure_during_recovery_discovery_recovers_the_replaceme
 
         with (
             patch.object(_connected_client(tool), "call_tool", side_effect=ClosedResourceError()),
-            patch.object(tool, "_is_call_replayable", return_value=True),
             patch.object(tool, "_check_connection", side_effect=fail_replacement_once),
+            pytest.raises(ToolExecutionException, match="outcome is unknown"),
         ):
             await tool.call_tool("record", marker="recovered")
         assert replacement_failed
         assert len(_requests_for_method(requests, "initialize")) == 3
-        assert writes["token-a"] == ["recovered"]
+        assert writes["token-a"] == []
+
+        # The recovered replacement connection serves a later, distinct call.
+        assert await tool.call_tool("record", marker="later") is not None
+        assert writes["token-a"] == ["later"]
 
 
 async def test_cancelling_recovery_propagates_and_releases_the_exclusive_barrier(

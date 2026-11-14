@@ -8,7 +8,6 @@ import argparse
 import asyncio
 from collections.abc import Sequence
 
-from mcp import types
 from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -42,16 +41,17 @@ def create_server(*, mount_path: str) -> MCPServer:
     async def healthz(_request: Request) -> Response:
         """Return a simple readiness response for CI health checks."""
         await asyncio.sleep(0)
-        return JSONResponse({
-            "status": "ok",
-            "name": SERVER_NAME,
-            "mcp_path": mount_path,
-        })
+        return JSONResponse(
+            {
+                "status": "ok",
+                "name": SERVER_NAME,
+                "mcp_path": mount_path,
+            }
+        )
 
     @server.tool(
         name="search_agent_framework_docs",
         description="Return deterministic Agent Framework documentation text for MCP integration tests.",
-        annotations=types.ToolAnnotations(read_only_hint=True),
     )
     def search_agent_framework_docs(query: str) -> str:
         """Return a deterministic response for the MCP integration tests."""

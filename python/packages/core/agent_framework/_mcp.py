@@ -16,7 +16,6 @@ from contextvars import ContextVar
 from copy import copy
 from dataclasses import dataclass
 from datetime import date, datetime
-from functools import partial
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from inspect import currentframe, isawaitable
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, TypeAlias, TypedDict, TypeVar, cast
@@ -1301,7 +1300,6 @@ class MCPTool:
         max_discovery_items: int | None = _DEFAULT_MCP_DISCOVERY_MAX_ITEMS,
         max_host_payload_size_bytes: int | None = _DEFAULT_MCP_HOST_PAYLOAD_SIZE_BYTES,
         tool_result_content: MCPToolResultContentMode = "structured_first",
-        trust_server_idempotency_hints: bool = False,
     ) -> None:
         """Initialize the MCP Tool base.
 
@@ -1359,7 +1357,6 @@ class MCPTool:
         self.max_discovery_pages = max_discovery_pages
         self.max_discovery_items = max_discovery_items
         self.max_host_payload_size_bytes = max_host_payload_size_bytes
-        self.trust_server_idempotency_hints = trust_server_idempotency_hints
         self._exit_stack = AsyncExitStack()
         self._lifecycle_lock = asyncio.Lock()
         self._lifecycle_request_lock = asyncio.Lock()
@@ -1410,8 +1407,8 @@ class MCPTool:
         self._progressive_loader_functions: list[FunctionTool] | None = None
         self._progressive_loaded_tool_names: set[str] = set()
         self._tool_call_meta_by_name: dict[str, dict[str, Any]] = {}
-        self._tool_annotations_by_name: dict[str, types.ToolAnnotations | None] = {}
         self._tool_param_names_by_name: dict[str, set[str]] = {}
+        self._tool_annotations_by_name: dict[str, Any] = {}
         self._global_extra_arg_names, self._tool_extra_arg_names = _normalize_additional_tool_argument_names(
             additional_tool_argument_names
         )
@@ -2471,8 +2468,8 @@ class MCPTool:
             if not isinstance((function.additional_properties or {}).get(_MCP_REMOTE_NAME_KEY), str)
         ]
         self._tool_call_meta_by_name.clear()
-        self._tool_annotations_by_name.clear()
         self._tool_param_names_by_name.clear()
+        self._tool_annotations_by_name.clear()
         self._progressive_loaded_tool_names.clear()
 
     def _reset_session_state(self) -> None:
@@ -3616,8 +3613,8 @@ class MCPTool:
                 function.approval_mode = tool_approval_updates[function.name]
         self._functions[:] = current_functions
         self._tool_call_meta_by_name = tool_call_meta_by_name
-        self._tool_annotations_by_name = tool_annotations_by_name
         self._tool_param_names_by_name = tool_param_names_by_name
+        self._tool_annotations_by_name = tool_annotations_by_name
         self._progressive_loaded_tool_names.difference_update(existing_tools.keys() - reused_tool_names)
 
     async def _cancel_pending_reload_tasks(self) -> None:
@@ -3760,7 +3757,9 @@ class MCPTool:
 
         Raises:
             ToolExecutionException: If the MCP server is not connected, tools are not loaded,
-                or the tool call fails.
+                or the tool call fails. A dropped connection raises with the remote execution
+                outcome unknown and the connection error as the cause: the call is not retried,
+                because it may already have executed on the server.
         """
         return await self._call_tool(tool_name, kwargs)
 
@@ -3797,20 +3796,13 @@ class MCPTool:
             )
 
     async def _invoke_tool(
-        self,
-        tool_name: str,
-        kwargs: dict[str, Any],
-        trace_context: otel_context.Context,
-        *,
-        before_dispatch: Callable[[], None] | None = None,
+        self, tool_name: str, kwargs: dict[str, Any], trace_context: otel_context.Context
     ) -> types.CallToolResult:
         token = otel_context.attach(trace_context)
         try:
             filtered_kwargs, meta = self._prepare_call_kwargs(tool_name, kwargs)
         finally:
             otel_context.detach(token)
-        if before_dispatch is not None:
-            before_dispatch()
         return await self._require_connection().call_tool(tool_name, filtered_kwargs, meta=meta)
 
     async def _call_tool_with_retries(
@@ -3821,137 +3813,76 @@ class MCPTool:
         parser: Callable[..., str | list[Content]],
         span: otel_trace.Span,
     ) -> str | list[Content]:
-        """Execute the MCP tools/call RPC with retry logic."""
+        """Execute the MCP tools/call RPC, recovering the connection without replaying the call."""
         from anyio import ClosedResourceError
         from mcp import MCPError
 
-        replay_eligible = False
-        lost_connection: Exception | None = None
-        replay_error: ToolExecutionException | None = None
+        failed_connection = self._connection
+        close_generation = self._close_generation
+        span_error_recorded = False
+        try:
+            result = await self._invoke_tool(tool_name, kwargs, trace_context)
+            _capture_mcp_result(self, result)
+            if result.is_error:
+                parsed = parser(result)
+                text = (
+                    "\n".join(c.text for c in parsed if c.type == "text" and c.text)
+                    if isinstance(parsed, list)
+                    else str(parsed)
+                )
+                # Per OTel MCP semconv: set error.type="tool_error" for isError results
+                if span.is_recording():
+                    set_mcp_span_error(span, "tool_error", text or str(parsed))
+                    span_error_recorded = True
+                raise _mcp_tool_execution_exception(text or str(parsed))
+            return parser(result)
+        except ToolExecutionException as tool_ex:
+            if span.is_recording() and not span_error_recorded:
+                set_mcp_span_error(span, type(tool_ex).__name__, str(tool_ex))
+            raise
+        except (ClosedResourceError, MCPError) as call_ex:
+            if not self._is_connection_loss(call_ex):
+                error_message = call_ex.error.message if isinstance(call_ex, MCPError) else str(call_ex)
+                if span.is_recording():
+                    set_mcp_span_error(span, type(call_ex).__name__, error_message)
+                raise _mcp_tool_execution_exception(error_message, inner_exception=call_ex) from call_ex
 
-        def validate_replay_eligibility(
-            attempt: int,
-            connection_error: Exception | None,
-            unknown_outcome: ToolExecutionException | None,
-        ) -> None:
-            nonlocal replay_eligible
-            if attempt == 0:
-                replay_eligible = self._is_call_replayable(tool_name)
-                return
-            if replay_eligible and self._is_call_replayable(tool_name):
-                return
-            cause = cast(Exception, connection_error)
-            error = cast(ToolExecutionException, unknown_outcome)
-            raise error from cause
-
-        for attempt in range(2):
-            failed_connection = self._connection
-            close_generation = self._close_generation
-            span_error_recorded = False
+            # The server may have executed the request before the response was lost, so the
+            # outcome is unknown and re-issuing it could duplicate a non-idempotent effect.
+            # Restore availability for the next call and leave the retry decision to the caller.
             try:
-                result = await self._invoke_tool(
-                    tool_name,
-                    kwargs,
-                    trace_context,
-                    before_dispatch=partial(
-                        validate_replay_eligibility,
-                        attempt,
-                        lost_connection,
-                        replay_error,
-                    ),
-                )
-                _capture_mcp_result(self, result)
-                if result.is_error:
-                    parsed = parser(result)
-                    text = (
-                        "\n".join(c.text for c in parsed if c.type == "text" and c.text)
-                        if isinstance(parsed, list)
-                        else str(parsed)
-                    )
-                    # Per OTel MCP semconv: set error.type="tool_error" for isError results
-                    if span.is_recording():
-                        set_mcp_span_error(span, "tool_error", text or str(parsed))
-                        span_error_recorded = True
-                    raise _mcp_tool_execution_exception(text or str(parsed))
-                return parser(result)
-            except ToolExecutionException as tool_ex:
-                if span.is_recording() and not span_error_recorded:
-                    if tool_ex is replay_error and lost_connection is not None:
-                        set_mcp_span_error(span, type(lost_connection).__name__, str(lost_connection))
-                    else:
-                        set_mcp_span_error(span, type(tool_ex).__name__, str(tool_ex))
-                raise
-            except (ClosedResourceError, MCPError) as call_ex:
-                if not self._is_connection_loss(call_ex):
-                    error_message = call_ex.error.message if isinstance(call_ex, MCPError) else str(call_ex)
-                    if span.is_recording():
-                        set_mcp_span_error(span, type(call_ex).__name__, error_message)
-                    raise _mcp_tool_execution_exception(error_message, inner_exception=call_ex) from call_ex
-
-                if attempt == 0:
-                    try:
-                        await self._recover_connection_after_loss(
-                            operation="tool call",
-                            inner_exception=call_ex,
-                            load_configured=True,
-                            failed_connection=failed_connection,
-                            close_generation=close_generation,
-                        )
-                    except ToolExecutionException as recovery_error:
-                        if span.is_recording():
-                            set_mcp_span_error(span, type(recovery_error).__name__, str(recovery_error))
-                        raise
-                    # HTTP admission can reconcile a different identity on retry. Validate the
-                    # original and replacement catalogs only after that reconciliation, before dispatch.
-                    lost_connection = call_ex
-                    replay_error = _mcp_tool_execution_exception(
-                        f"Failed to call tool '{tool_name}' - connection lost and the remote "
-                        "execution outcome is unknown. The connection was re-established but "
-                        "the call was not replayed, because replay requires both a server "
-                        "idempotent/read-only hint and the client-owned "
-                        "trust_server_idempotency_hints opt-in; retry explicitly if safe.",
-                        inner_exception=call_ex,
-                    )
-                    continue
-
-                # Second attempt also failed, give up.
-                _log_mcp_exception(
-                    logging.ERROR,
-                    call_ex,
-                    "MCP connection closed unexpectedly after reconnection: %s",
-                    call_ex,
-                    redacted_message="MCP tool call connection closed after reconnection",
-                )
-                if span.is_recording():
-                    set_mcp_span_error(span, type(call_ex).__name__, str(call_ex))
-                raise _mcp_tool_execution_exception(
-                    f"Failed to call tool '{tool_name}' - connection lost.",
+                await self._recover_connection_after_loss(
+                    operation="tool call",
                     inner_exception=call_ex,
-                ) from call_ex
-            except Exception as ex:
+                    load_configured=True,
+                    failed_connection=failed_connection,
+                    close_generation=close_generation,
+                )
+            except ToolExecutionException as recovery_error:
                 if span.is_recording():
-                    set_mcp_span_error(span, type(ex).__name__, str(ex))
-                raise _mcp_tool_execution_exception(f"Failed to call tool '{tool_name}'.", inner_exception=ex) from ex
-        retries_exhausted = _mcp_tool_execution_exception(f"Failed to call tool '{tool_name}' after retries.")
-        if span.is_recording():
-            set_mcp_span_error(span, type(retries_exhausted).__name__, str(retries_exhausted))
-        raise retries_exhausted
-
-    def _is_call_replayable(self, tool_name: str) -> bool:
-        """Return True if *tool_name* may be replayed after connection loss.
-
-        Replay requires both a client-owned trust decision
-        (``trust_server_idempotency_hints=True``) and a server annotation carrying
-        ``idempotentHint`` or ``readOnlyHint``. Annotations are supplied by the
-        server and are untrusted by default, consistent with how the rest of the
-        package treats ``ToolAnnotations`` as restriction-only hints: without the
-        client's explicit opt-in, a misannotated or untrusted server could get a
-        non-idempotent ``tools/call`` executed twice on a lost response.
-        """
-        if not self.trust_server_idempotency_hints:
-            return False
-        annotations = self._tool_annotations_by_name.get(tool_name)
-        return bool(annotations and (annotations.idempotent_hint or annotations.read_only_hint))
+                    set_mcp_span_error(span, type(recovery_error).__name__, str(recovery_error))
+                raise
+            if span.is_recording():
+                set_mcp_span_error(span, type(call_ex).__name__, str(call_ex))
+            _log_mcp_exception(
+                logging.WARNING,
+                call_ex,
+                "MCP tool call %r lost its response and was not retried: %s",
+                tool_name,
+                call_ex,
+                redacted_message="MCP tool call outcome is unknown after connection loss; the call was not retried",
+            )
+            raise _mcp_tool_execution_exception(
+                f"Failed to call tool '{tool_name}' - connection lost and the remote execution "
+                "outcome is unknown. The call was not retried because it may already have "
+                "executed on the server. The connection was re-established, so a later call "
+                "can proceed; reconcile the outcome before retrying this one.",
+                inner_exception=call_ex,
+            ) from call_ex
+        except Exception as ex:
+            if span.is_recording():
+                set_mcp_span_error(span, type(ex).__name__, str(ex))
+            raise _mcp_tool_execution_exception(f"Failed to call tool '{tool_name}'.", inner_exception=ex) from ex
 
     def _resolved_extra_args(self, tool_name: str) -> set[str]:
         """Return the user-configured extra argument names allowed for a tool."""
@@ -4197,7 +4128,6 @@ class MCPStdioTool(MCPTool):
         max_discovery_items: int | None = _DEFAULT_MCP_DISCOVERY_MAX_ITEMS,
         max_host_payload_size_bytes: int | None = _DEFAULT_MCP_HOST_PAYLOAD_SIZE_BYTES,
         tool_result_content: MCPToolResultContentMode = "structured_first",
-        trust_server_idempotency_hints: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the MCP stdio tool.
@@ -4321,11 +4251,6 @@ class MCPStdioTool(MCPTool):
                 transports. ``None`` disables the limit.
             tool_result_content: How to choose model-visible text when both ``content`` and
                 ``structuredContent`` are present. See :data:`MCPToolResultContentMode`.
-            trust_server_idempotency_hints: When ``True``, treat server-declared
-                ``idempotentHint``/``readOnlyHint`` tool annotations as trustworthy, allowing
-                a ``tools/call`` whose response was lost to a dropped connection to be retried
-                once after reconnect. Annotations are server-supplied and untrusted by default,
-                so the default ``False`` never replays an ambiguous call.
             kwargs: Additional arguments for framework-owned ``StdioServerParameters`` construction.
         """
         if mcp_client is not None and session is not None:
@@ -4384,7 +4309,6 @@ class MCPStdioTool(MCPTool):
             max_discovery_items=max_discovery_items,
             max_host_payload_size_bytes=max_host_payload_size_bytes,
             tool_result_content=tool_result_content,
-            trust_server_idempotency_hints=trust_server_idempotency_hints,
         )
         self.command = command
         self.args = args or []
@@ -4487,7 +4411,6 @@ class MCPStreamableHTTPTool(MCPTool):
         max_discovery_items: int | None = _DEFAULT_MCP_DISCOVERY_MAX_ITEMS,
         max_host_payload_size_bytes: int | None = _DEFAULT_MCP_HOST_PAYLOAD_SIZE_BYTES,
         tool_result_content: MCPToolResultContentMode = "structured_first",
-        trust_server_idempotency_hints: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the MCP streamable HTTP tool.
@@ -4685,11 +4608,6 @@ class MCPStreamableHTTPTool(MCPTool):
                 transports. ``None`` disables the limit.
             tool_result_content: How to choose model-visible text when both ``content`` and
                 ``structuredContent`` are present. See :data:`MCPToolResultContentMode`.
-            trust_server_idempotency_hints: When ``True``, treat server-declared
-                ``idempotentHint``/``readOnlyHint`` tool annotations as trustworthy, allowing
-                a ``tools/call`` whose response was lost to a dropped connection to be retried
-                once after reconnect. Annotations are server-supplied and untrusted by default,
-                so the default ``False`` never replays an ambiguous call.
             kwargs: Additional keyword arguments (accepted for backward compatibility but not used).
         """
         if mcp_client is not None and session is not None:
@@ -4748,7 +4666,6 @@ class MCPStreamableHTTPTool(MCPTool):
             max_discovery_items=max_discovery_items,
             max_host_payload_size_bytes=max_host_payload_size_bytes,
             tool_result_content=tool_result_content,
-            trust_server_idempotency_hints=trust_server_idempotency_hints,
         )
         self.url = url
         self.terminate_on_close = terminate_on_close
@@ -5126,20 +5043,10 @@ class MCPStreamableHTTPTool(MCPTool):
             )
 
     async def _invoke_tool(
-        self,
-        tool_name: str,
-        kwargs: dict[str, Any],
-        trace_context: otel_context.Context,
-        *,
-        before_dispatch: Callable[[], None] | None = None,
+        self, tool_name: str, kwargs: dict[str, Any], trace_context: otel_context.Context
     ) -> types.CallToolResult:
         async with self._http_operation():
-            return await super()._invoke_tool(
-                tool_name,
-                kwargs,
-                trace_context,
-                before_dispatch=before_dispatch,
-            )
+            return await super()._invoke_tool(tool_name, kwargs, trace_context)
 
     async def _invoke_prompt(self, prompt_name: str, kwargs: dict[str, Any]) -> types.GetPromptResult:
         async with self._http_operation():
@@ -5360,7 +5267,6 @@ class MCPWebsocketTool(MCPTool):
         max_discovery_items: int | None = _DEFAULT_MCP_DISCOVERY_MAX_ITEMS,
         max_host_payload_size_bytes: int | None = _DEFAULT_MCP_HOST_PAYLOAD_SIZE_BYTES,
         tool_result_content: MCPToolResultContentMode = "structured_first",
-        trust_server_idempotency_hints: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the deprecated MCP WebSocket compatibility wrapper.
@@ -5468,11 +5374,6 @@ class MCPWebsocketTool(MCPTool):
                 transports. ``None`` disables the limit.
             tool_result_content: How to choose model-visible text when both ``content`` and
                 ``structuredContent`` are present. See :data:`MCPToolResultContentMode`.
-            trust_server_idempotency_hints: When ``True``, treat server-declared
-                ``idempotentHint``/``readOnlyHint`` tool annotations as trustworthy, allowing
-                a ``tools/call`` whose response was lost to a dropped connection to be retried
-                once after reconnect. Annotations are server-supplied and untrusted by default,
-                so the default ``False`` never replays an ambiguous call.
             kwargs: Deprecated compatibility arguments. They are not used.
         """
         super().__init__(
@@ -5500,7 +5401,6 @@ class MCPWebsocketTool(MCPTool):
             max_discovery_items=max_discovery_items,
             max_host_payload_size_bytes=max_host_payload_size_bytes,
             tool_result_content=tool_result_content,
-            trust_server_idempotency_hints=trust_server_idempotency_hints,
         )
         self.url = url
         self._client_kwargs = kwargs

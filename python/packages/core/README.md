@@ -179,6 +179,27 @@ asyncio.run(main())
 
 You can explore additional agent samples [here](https://github.com/microsoft/agent-framework/tree/main/python/samples/02-agents).
 
+### MCP tool calls after a lost response
+
+**Breaking change:** a `tools/call` whose connection drops is no longer sent a second
+time. The server may have executed the request before the response was lost, so
+re-issuing it could run a non-idempotent operation twice. `call_tool` and tool
+invocations now raise `ToolExecutionException` stating that the outcome is unknown
+and the call was not retried, with the connection error as `__cause__`. Server
+`idempotentHint` and `readOnlyHint` annotations are advisory and do not enable a
+retry. Discovery (`tools/list`) and `get_prompt` keep their existing retry behavior.
+
+For framework-owned connections the connection is still recovered before the
+exception surfaces, so a later, different call proceeds normally. Caller-supplied
+`Client` and `ClientSession` objects are never recreated and keep their existing
+"caller-owned and cannot be recreated" error.
+
+Catch `ToolExecutionException` around calls that must not run twice and reconcile the
+outcome in your own code, for example by reading back the record the tool writes, or
+by using a server that enforces an idempotency key. Then retry explicitly if it is
+safe. This prevents the framework from duplicating an operation; it is not an
+exactly-once guarantee.
+
 ### MCP HTTP client ownership and cookies
 
 **Breaking change:** HTTP clients created by `MCPStreamableHTTPTool` no longer persist
