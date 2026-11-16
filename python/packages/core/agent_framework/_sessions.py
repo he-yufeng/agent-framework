@@ -204,6 +204,8 @@ def _same_stored_payload(left: Any, right: Any) -> bool:
         return len(left_items) == len(right_items) and all(
             _same_stored_payload(a, b) for a, b in zip(left_items, right_items, strict=True)
         )
+    if isinstance(left, float) and math.isnan(left):
+        return math.isnan(right)
     return bool(left == right)
 
 

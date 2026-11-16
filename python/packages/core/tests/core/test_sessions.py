@@ -2560,6 +2560,22 @@ class TestFileHistoryProvider:
         assert loaded[0].additional_properties["flag"] is True
 
     @pytest.mark.parametrize("serialization_format", ["json", "msgpack"])
+    async def test_replay_with_nan_payload_does_not_rewrite(
+        self, tmp_path: Path, serialization_format: Literal["json", "msgpack"]
+    ) -> None:
+        """NaN never equals itself, so an unchanged NaN payload must not force a full rewrite."""
+        provider = FileHistoryProvider(tmp_path, serialization_format=serialization_format)
+        message = Message(role="user", contents=["question"], message_id="m1")
+        message.additional_properties["score"] = math.nan
+        await provider.save_messages("s1", [message])
+        session_file = provider._session_file_path("s1")
+        before_inode = session_file.stat().st_ino
+
+        await provider.save_messages("s1", [message])
+
+        assert session_file.stat().st_ino == before_inode
+
+    @pytest.mark.parametrize("serialization_format", ["json", "msgpack"])
     async def test_annotation_update_works_for_long_session_ids(
         self, tmp_path: Path, serialization_format: Literal["json", "msgpack"]
     ) -> None:
