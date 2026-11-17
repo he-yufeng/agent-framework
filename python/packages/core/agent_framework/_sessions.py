@@ -2836,11 +2836,9 @@ class FileHistoryProvider(HistoryProvider):
         self, file_path: Path, merged: Sequence[Message], new_messages: Sequence[Message]
     ) -> None:
         """Replace the transcript atomically so a failed encode leaves the old file intact."""
-        serialized = "".join(
-            f"{self._serialize_json_message(message)}\n" for message in [*merged, *new_messages]
-        ).encode("utf-8")
         with self._staging_history_file(file_path) as stage:
-            stage.write(serialized)
+            for message in [*merged, *new_messages]:
+                stage.write(f"{self._serialize_json_message(message)}\n".encode("utf-8"))
 
     def _rewrite_msgpack_messages(
         self, file_path: Path, merged: Sequence[Message], new_messages: Sequence[Message]

@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft. All rights reserved.
 
 import asyncio
+import contextlib
 import json
 import math
 import os
@@ -2430,6 +2431,59 @@ class TestFileHistoryProvider:
 
         assert await asyncio.to_thread(session_file.read_bytes) == before
         assert session_file.stat().st_mtime_ns == before_mtime
+
+    @pytest.mark.parametrize("serialization_format", ["json", "msgpack"])
+    async def test_reconstructed_replay_does_not_rewrite(
+        self, tmp_path: Path, serialization_format: Literal["json", "msgpack"]
+    ) -> None:
+        """Fresh message objects rebuilt from disk retain the same serialized payload."""
+        provider = FileHistoryProvider(tmp_path, serialization_format=serialization_format)
+        messages = [
+            Message(role="user", contents=["question"], message_id="m1"),
+            Message(role="assistant", contents=["answer"], message_id="m2"),
+        ]
+        await provider.save_messages("s1", messages)
+        session_file = provider._session_file_path("s1")
+        before_inode = session_file.stat().st_ino
+
+        reconstructed = await provider.get_messages("s1")
+        await provider.save_messages("s1", reconstructed)
+
+        assert session_file.stat().st_ino == before_inode
+
+    async def test_json_annotation_update_streams_records(self, tmp_path: Path) -> None:
+        """JSON replacement writes each record instead of one whole-transcript string."""
+        provider = FileHistoryProvider(tmp_path, serialization_format="json")
+        first = Message(role="user", contents=["one"], message_id="m1")
+        second = Message(role="assistant", contents=["two"], message_id="m2")
+        await provider.save_messages("s1", [first, second])
+        first.additional_properties["_excluded"] = True
+        third = Message(role="user", contents=["three"], message_id="m3")
+        original_stage = FileHistoryProvider._staging_history_file
+        writes: list[bytes] = []
+
+        @contextlib.contextmanager
+        def tracked_stage(path: Path):
+            with original_stage(path) as stage:
+
+                class RecordingWriter:
+                    def write(self, data: bytes) -> int:
+                        writes.append(bytes(data))
+                        return stage.write(data)
+
+                yield RecordingWriter()
+
+        with (
+            patch.object(
+                FileHistoryProvider,
+                "_serialize_json_message",
+                side_effect=lambda message: json.dumps(message.text),
+            ),
+            patch.object(FileHistoryProvider, "_staging_history_file", staticmethod(tracked_stage)),
+        ):
+            await provider.save_messages("s1", [first, second, third])
+
+        assert writes == [b'"one"\n', b'"two"\n', b'"three"\n']
 
     @pytest.mark.parametrize("serialization_format", ["json", "msgpack"])
     async def test_annotation_update_keeps_transcript_order_and_appends_new_messages(
